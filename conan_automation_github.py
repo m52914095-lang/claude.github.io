@@ -1,22 +1,14 @@
 """
 conan_automation_github.py — Detective Conan automated downloader + uploader
 
-Bulk-safe fixes (handles 30+ videos without failing):
-  • NEVER calls sys.exit(1) mid-loop — failed episodes are logged and skipped
-  • Git commit/push happens ONCE at the very end, not after every episode
-  • Each HS output uses a unique filename (no overwrites during batch runs)
-  • Upload server URL is fetched once and reused for the whole run
-  • Upload retries up to 3 times before giving up on a file
-  • git pull --rebase before pushing to avoid push rejections
-
-Features:
-  • Auto-calculates episode from BASE_DATE / BASE_EPISODE
-  • Searches Nyaa.si (SubsPlease default, or custom uploader)
-  • MAGNET_LINKS env var = batch magnets (newline or comma-separated)
-  • Downloads via aria2c — no seeding
-  • SS upload: original .mkv → DoodStream (SOFT_SUB_FOLDER_ID)
-  • HS upload: ffmpeg hard-subbed .mp4 → DoodStream (HARD_SUB_FOLDER_ID)
-  • Patches index.html and does a single git commit + push at the end
+Fixes in this version:
+  • SS upload: remuxes .mkv → .mp4 (stream copy, ~30 sec) so DoodStream accepts it
+  • Titles set via DoodStream rename API after upload (upload endpoint ignores title param)
+  • Episode/movie number always taken from the original filename
+  • Movie mode: set MOVIE_MODE=1 to treat all files as movies
+  • Single git commit+push at end of run — never mid-loop
+  • Per-episode error isolation — 1 failure never kills the batch
+  • Upload retries x3 with server URL refresh each attempt
 """
 
 import os
@@ -31,7 +23,7 @@ import requests
 from bs4 import BeautifulSoup
 
 from conan_utils import xor_encrypt
-from update import patch_hs, patch_ss, read_html, write_html
+from update import patch_hs, patch_ss, patch_movie_hs, patch_movie_ss, read_html, write_html
 
 # ── Config ────────────────────────────────────────────────────────────────────
 DOODSTREAM_API_KEY  = os.environ.get("DOODSTREAM_API_KEY", "554366xrjxeza9m7e4m02v")
@@ -46,8 +38,14 @@ MAGNET_LINKS        = os.environ.get("MAGNET_LINKS",        "").strip()
 CUSTOM_SEARCH       = os.environ.get("CUSTOM_SEARCH",       "").strip()
 NYAA_UPLOADER_URL   = os.environ.get("NYAA_UPLOADER_URL",   "").strip()
 
+# Set MOVIE_MODE=1 to treat all downloaded files as movies instead of episodes
+MOVIE_MODE          = os.environ.get("MOVIE_MODE", "0").strip() == "1"
+
+# Title templates — {ep} = episode number, {num} = movie number
 HS_TITLE_TPL        = os.environ.get("HS_TITLE_TPL", "Detective Conan - {ep} HS")
 SS_TITLE_TPL        = os.environ.get("SS_TITLE_TPL", "Detective Conan - {ep} SS")
+MOVIE_HS_TITLE_TPL  = os.environ.get("MOVIE_HS_TITLE_TPL", "Detective Conan Movie - {num} HS")
+MOVIE_SS_TITLE_TPL  = os.environ.get("MOVIE_SS_TITLE_TPL", "Detective Conan Movie - {num} SS")
 
 HTML_FILE           = os.environ.get("HTML_FILE", "index.html")
 
@@ -56,24 +54,42 @@ RETRY_DELAY         = 10
 
 _upload_server_url: str | None = None
 
-# ── Episode helpers ───────────────────────────────────────────────────────────
+
+# ── Episode / movie number from filename ──────────────────────────────────────
+
+def parse_number_from_filename(filename: str) -> int | None:
+    """
+    Extract the episode/movie number from the original torrent filename.
+    Handles formats like:
+      [SubsPlease] Detective Conan - 1194 (1080p) [ABC].mkv
+      Detective Conan Movie 28 - One-Eyed Flashback [1080p].mkv
+    """
+    base = os.path.basename(filename)
+
+    # "Detective Conan - 1194" style  (episodes)
+    m = re.search(r"Detective Conan\s*[-\u2013]\s*(\d{3,4})\b", base, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    # "Detective Conan Movie 28" or "Movie - 28" style
+    m = re.search(r"\bMovie\s*[-\u2013]?\s*(\d{1,3})\b", base, re.IGNORECASE)
+    if m:
+        return int(m.group(1))
+
+    # Last fallback: first 3-4 digit number in the basename
+    m = re.search(r"\b(\d{3,4})\b", base)
+    if m:
+        return int(m.group(1))
+
+    return None
+
 
 def get_expected_episode() -> int:
     if EPISODE_OVERRIDE and EPISODE_OVERRIDE.isdigit():
         return int(EPISODE_OVERRIDE)
     base_dt = datetime.strptime(BASE_DATE, "%Y-%m-%d")
-    weeks = max(0, (datetime.now() - base_dt).days // 7)
+    weeks   = max(0, (datetime.now() - base_dt).days // 7)
     return BASE_EPISODE + weeks
-
-
-def parse_episode_from_filename(filename: str) -> int | None:
-    m = re.search(r"Detective Conan\s*[-\u2013]\s*(\d{3,4})\b", filename, re.IGNORECASE)
-    if m:
-        return int(m.group(1))
-    m = re.search(r"\b(\d{3,4})\b", os.path.basename(filename))
-    if m:
-        return int(m.group(1))
-    return None
 
 
 # ── Nyaa search ───────────────────────────────────────────────────────────────
@@ -87,13 +103,12 @@ def search_nyaa(episode: int) -> str | None:
     try:
         soup = BeautifulSoup(requests.get(url, timeout=30).text, "html.parser")
     except Exception as e:
-        print(f"  Nyaa search error: {e}", file=sys.stderr)
+        print(f"  Nyaa error: {e}", file=sys.stderr)
         return None
 
     for row in soup.select("tr.success, tr.default"):
         title_cell = row.find("td", {"colspan": "2"}) or row.find("a", title=True)
-        title_text = title_cell.get_text() if title_cell else ""
-        if "1080p" not in title_text:
+        if title_cell and "1080p" not in title_cell.get_text():
             continue
         for link in row.find_all("a", href=True):
             if link["href"].startswith("magnet:"):
@@ -113,19 +128,15 @@ def download_magnet(magnet: str) -> list:
     before = set(glob.glob("**/*.mkv", recursive=True))
     print(f"  Downloading: {magnet[:90]}...")
 
-    cmd = [
-        "aria2c",
-        "--seed-time=0",
-        "--max-connection-per-server=4",
-        "--split=4",
-        "--file-allocation=none",
-        "--bt-stop-timeout=300",
-        magnet,
-    ]
     try:
-        subprocess.run(cmd, check=True, timeout=7200)
+        subprocess.run([
+            "aria2c", "--seed-time=0",
+            "--max-connection-per-server=4", "--split=4",
+            "--file-allocation=none", "--bt-stop-timeout=300",
+            magnet,
+        ], check=True, timeout=7200)
     except subprocess.TimeoutExpired:
-        print("  aria2c timeout — checking for partial files", file=sys.stderr)
+        print("  aria2c timeout — checking partial files", file=sys.stderr)
     except subprocess.CalledProcessError as e:
         print(f"  aria2c error: {e}", file=sys.stderr)
 
@@ -135,16 +146,51 @@ def download_magnet(magnet: str) -> list:
     return new
 
 
-# ── ffmpeg hard-sub ───────────────────────────────────────────────────────────
+# ── ffmpeg helpers ────────────────────────────────────────────────────────────
 
 def _esc(path: str) -> str:
     p = path.replace("\\", "\\\\").replace("'", "\\'")
-    p = p.replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
-    return p
+    return p.replace(":", "\\:").replace("[", "\\[").replace("]", "\\]")
 
 
-def hardsub(input_file: str, ep: int) -> str | None:
-    output = f"conan_{ep}_hs.mp4"   # unique per episode — no overwrites
+def remux_to_mp4(input_file: str, label: str) -> str | None:
+    """
+    Stream-copy .mkv → .mp4  (no re-encode, takes ~30 seconds).
+    DoodStream requires mp4; this fixes the SS 'not uploading' issue.
+    """
+    output = f"conan_{label}_ss.mp4"
+    print(f"  Remuxing to mp4 for SS upload -> {output}")
+    cmd = [
+        "ffmpeg", "-y", "-i", input_file,
+        "-c:v", "copy", "-c:a", "copy",
+        "-c:s", "mov_text",          # convert subtitles to mp4-compatible format
+        output,
+    ]
+    try:
+        subprocess.run(cmd, check=True, capture_output=True, text=True, timeout=600)
+        print(f"  Remux complete: {output}")
+        return output
+    except subprocess.CalledProcessError as e:
+        # Fallback: drop subtitle track (some mkv sub formats can't be remuxed)
+        print(f"  Remux with subs failed, retrying without subtitle track...", file=sys.stderr)
+        cmd_nosub = [
+            "ffmpeg", "-y", "-i", input_file,
+            "-c:v", "copy", "-c:a", "copy",
+            "-sn",           # drop subtitle stream
+            output,
+        ]
+        try:
+            subprocess.run(cmd_nosub, check=True, capture_output=True, text=True, timeout=600)
+            print(f"  Remux (no subs) complete: {output}")
+            return output
+        except subprocess.CalledProcessError as e2:
+            print(f"  Remux failed entirely:\n{e2.stderr[-500:]}", file=sys.stderr)
+            return None
+
+
+def hardsub(input_file: str, label: str) -> str | None:
+    """Burn subtitles into video. Unique output name per episode."""
+    output = f"conan_{label}_hs.mp4"
     print(f"  Hard-subbing -> {output}")
 
     for vf in [f"subtitles='{_esc(input_file)}'", f"subtitles={_esc(input_file)}"]:
@@ -160,9 +206,9 @@ def hardsub(input_file: str, ep: int) -> str | None:
             print(f"  Hard-sub complete: {output}")
             return output
         except subprocess.CalledProcessError as e:
-            print(f"  ffmpeg attempt failed:\n{e.stderr[-800:]}", file=sys.stderr)
+            print(f"  ffmpeg attempt failed:\n{e.stderr[-600:]}", file=sys.stderr)
 
-    print(f"  Hard-sub FAILED for episode {ep}", file=sys.stderr)
+    print(f"  Hard-sub FAILED for {label}", file=sys.stderr)
     return None
 
 
@@ -182,17 +228,38 @@ def get_upload_server() -> str | None:
             _upload_server_url = resp["result"]
             return _upload_server_url
     except Exception as e:
-        print(f"  DoodStream server lookup error: {e}", file=sys.stderr)
+        print(f"  Upload server error: {e}", file=sys.stderr)
     return None
 
 
+def rename_dood_file(file_code: str, title: str) -> None:
+    """Set the DoodStream file title via the rename API."""
+    try:
+        resp = requests.get(
+            "https://doodapi.co/api/file/rename",
+            params={"key": DOODSTREAM_API_KEY, "file_code": file_code, "title": title},
+            timeout=15,
+        ).json()
+        if resp.get("status") == 200:
+            print(f"  Title set: '{title}'")
+        else:
+            print(f"  Rename API returned: {resp}", file=sys.stderr)
+    except Exception as e:
+        print(f"  Rename API error: {e}", file=sys.stderr)
+
+
 def upload_file(file_path: str, title: str, folder_id: str = "") -> str | None:
+    """
+    Upload file to DoodStream, then rename it.
+    Returns the embed/download URL or None.
+    Retries up to UPLOAD_RETRIES times.
+    """
     size_mb = os.path.getsize(file_path) // (1024 * 1024)
     print(f"  Uploading '{title}' ({size_mb} MB)...")
 
     for attempt in range(1, UPLOAD_RETRIES + 1):
         global _upload_server_url
-        _upload_server_url = None          # refresh server URL on every attempt
+        _upload_server_url = None          # always refresh server URL
         server = get_upload_server()
         if not server:
             print(f"  [attempt {attempt}] No upload server", file=sys.stderr)
@@ -201,7 +268,7 @@ def upload_file(file_path: str, title: str, folder_id: str = "") -> str | None:
 
         try:
             with open(file_path, "rb") as fh:
-                data = {"api_key": DOODSTREAM_API_KEY, "title": title}
+                data = {"api_key": DOODSTREAM_API_KEY}
                 if folder_id:
                     data["fld_id"] = folder_id
                 resp = requests.post(
@@ -212,8 +279,14 @@ def upload_file(file_path: str, title: str, folder_id: str = "") -> str | None:
                 ).json()
 
             if resp.get("status") == 200:
-                result = resp["result"][0]
-                url = result.get("download_url") or result.get("embed_url") or ""
+                result     = resp["result"][0]
+                file_code  = result.get("file_code") or result.get("filecode") or ""
+                url        = result.get("download_url") or result.get("embed_url") or ""
+
+                # Set title via rename API (upload endpoint ignores title param)
+                if file_code:
+                    rename_dood_file(file_code, title)
+
                 print(f"  Uploaded! {url}")
                 return url
             else:
@@ -230,32 +303,60 @@ def upload_file(file_path: str, title: str, folder_id: str = "") -> str | None:
     return None
 
 
-# ── Per-episode processing ────────────────────────────────────────────────────
+# ── Per-file processing ───────────────────────────────────────────────────────
 
-def process_episode(mkv_file: str):
-    """Process one .mkv. Returns (ep, hs_url, ss_url). Never raises."""
-    ep = parse_episode_from_filename(mkv_file)
-    if ep is None:
-        ep = get_expected_episode()
-        print(f"  Could not parse episode — using calculated: {ep}")
+def process_file(mkv_file: str):
+    """
+    Process one .mkv — detect number from original filename, upload SS+HS.
+    Returns (number, is_movie, hs_url, ss_url). Never raises.
+    """
+    num = parse_number_from_filename(mkv_file)
+    is_movie = MOVIE_MODE
+
+    if num is None:
+        num = get_expected_episode()
+        print(f"  Could not parse number from filename — using calculated: {num}")
     else:
-        print(f"\n-- Episode {ep} ({os.path.basename(mkv_file)}) --")
+        kind = "Movie" if is_movie else "Episode"
+        print(f"  {kind} {num} detected from: {os.path.basename(mkv_file)}")
 
-    hs_url = None
-    ss_url = None
+    label    = f"m{num}" if is_movie else str(num)
+    hs_url   = None
+    ss_url   = None
+    ss_file  = None
+    hs_file  = None
 
+    # ── SS: remux mkv→mp4 (stream copy) then upload ───────────────────────
     try:
-        ss_url = upload_file(mkv_file, SS_TITLE_TPL.format(ep=ep), SOFT_SUB_FOLDER_ID)
+        ss_file = remux_to_mp4(mkv_file, label)
+        if ss_file:
+            if is_movie:
+                title = MOVIE_SS_TITLE_TPL.format(num=num)
+            else:
+                title = SS_TITLE_TPL.format(ep=num)
+            ss_url = upload_file(ss_file, title, SOFT_SUB_FOLDER_ID)
+        else:
+            print(f"  Remux failed — skipping SS upload", file=sys.stderr)
     except Exception as e:
-        print(f"  SS upload exception: {e}", file=sys.stderr)
+        print(f"  SS exception: {e}", file=sys.stderr)
+    finally:
+        if ss_file and os.path.exists(ss_file):
+            try:
+                os.remove(ss_file)
+            except OSError:
+                pass
 
-    hs_file = None
+    # ── HS: burn subs then upload ─────────────────────────────────────────
     try:
-        hs_file = hardsub(mkv_file, ep)
+        hs_file = hardsub(mkv_file, label)
         if hs_file:
-            hs_url = upload_file(hs_file, HS_TITLE_TPL.format(ep=ep), HARD_SUB_FOLDER_ID)
+            if is_movie:
+                title = MOVIE_HS_TITLE_TPL.format(num=num)
+            else:
+                title = HS_TITLE_TPL.format(ep=num)
+            hs_url = upload_file(hs_file, title, HARD_SUB_FOLDER_ID)
     except Exception as e:
-        print(f"  HS processing exception: {e}", file=sys.stderr)
+        print(f"  HS exception: {e}", file=sys.stderr)
     finally:
         if hs_file and os.path.exists(hs_file):
             try:
@@ -263,44 +364,55 @@ def process_episode(mkv_file: str):
             except OSError:
                 pass
 
+    # Cleanup source
     try:
         os.remove(mkv_file)
     except OSError:
         pass
 
-    return ep, hs_url, ss_url
+    return num, is_movie, hs_url, ss_url
 
 
 # ── Batch HTML patch + single git push ───────────────────────────────────────
 
 def patch_html_batch(results: list) -> bool:
-    if not any(hs or ss for _, hs, ss in results):
-        print("\nNo URLs to patch — index.html unchanged.")
+    if not any(hs or ss for _, _m, hs, ss in results):
+        print("\nNo URLs obtained — index.html unchanged.")
         return False
 
     html = read_html()
-    for ep, hs_url, ss_url in results:
-        if hs_url:
-            html = patch_hs(html, ep, hs_url)
-        if ss_url:
-            html = patch_ss(html, ep, ss_url)
+    for num, is_movie, hs_url, ss_url in results:
+        if is_movie:
+            if hs_url:
+                html = patch_movie_hs(html, num, hs_url)
+            if ss_url:
+                html = patch_movie_ss(html, num, ss_url)
+        else:
+            if hs_url:
+                html = patch_hs(html, num, hs_url)
+            if ss_url:
+                html = patch_ss(html, num, ss_url)
+
     write_html(html)
     return True
 
 
-def git_commit_push(episodes: list) -> None:
-    ep_list = ", ".join(str(e) for e in sorted(episodes))
+def git_commit_push(results: list) -> None:
+    ep_parts  = [str(n) for n, m, hs, ss in results if not m and (hs or ss)]
+    mov_parts = [f"M{n}" for n, m, hs, ss in results if m and (hs or ss)]
+    label     = ", ".join(sorted(ep_parts) + mov_parts) or "unknown"
+
     try:
         subprocess.run(["git", "config", "user.email", "github-actions@github.com"], check=True)
         subprocess.run(["git", "config", "user.name",  "GitHub Actions"], check=True)
         subprocess.run(["git", "add", HTML_FILE], check=True)
         subprocess.run(
-            ["git", "commit", "-m", f"chore: add episode(s) {ep_list} SS+HS links"],
+            ["git", "commit", "-m", f"chore: add links for {label}"],
             check=True,
         )
-        subprocess.run(["git", "pull", "--rebase"], check=False)   # avoid rejection
+        subprocess.run(["git", "pull", "--rebase"], check=False)
         subprocess.run(["git", "push"], check=True)
-        print(f"\n  Git pushed for episodes: {ep_list}")
+        print(f"\n  Git pushed: {label}")
     except subprocess.CalledProcessError as e:
         print(f"  Git error: {e}", file=sys.stderr)
 
@@ -319,24 +431,24 @@ def main() -> None:
 
     if MAGNET_LINKS:
         magnets = parse_magnet_list(MAGNET_LINKS)
-        print(f"Batch mode: {len(magnets)} magnet(s)")
+        print(f"Batch mode: {len(magnets)} magnet(s) | Movie mode: {MOVIE_MODE}")
         for i, magnet in enumerate(magnets, 1):
             print(f"\n[{i}/{len(magnets)}] Downloading...")
             new_files = download_magnet(magnet)
             if not new_files:
-                print("  No .mkv files found — skipping this magnet", file=sys.stderr)
+                print("  No .mkv files found — skipping", file=sys.stderr)
             else:
                 all_mkv.extend(new_files)
     else:
         episode = get_expected_episode()
-        print(f"Auto mode — targeting episode {episode}")
-        magnet = search_nyaa(episode)
+        print(f"Auto mode — episode {episode} | Movie mode: {MOVIE_MODE}")
+        magnet  = search_nyaa(episode)
         if not magnet:
-            print(f"Episode {episode} not on Nyaa yet — exiting cleanly.")
+            print(f"Episode {episode} not on Nyaa yet.")
             sys.exit(0)
         new_files = download_magnet(magnet)
         if not new_files:
-            print("Download produced no .mkv files", file=sys.stderr)
+            print("No .mkv files after download", file=sys.stderr)
             sys.exit(1)
         all_mkv.extend(new_files)
 
@@ -350,32 +462,29 @@ def main() -> None:
     for i, mkv in enumerate(all_mkv, 1):
         print(f"\n[{i}/{len(all_mkv)}] {os.path.basename(mkv)}")
         try:
-            ep, hs_url, ss_url = process_episode(mkv)
-            results.append((ep, hs_url, ss_url))
+            results.append(process_file(mkv))
         except Exception as e:
-            print(f"  FATAL ERROR processing {mkv}: {e}", file=sys.stderr)
-            # Continue to next file — never bail on the whole batch
+            print(f"  FATAL ERROR: {e}", file=sys.stderr)
 
     if results:
         changed = patch_html_batch(results)
         if changed:
-            successful_eps = [ep for ep, hs, ss in results if hs or ss]
-            if successful_eps:
-                git_commit_push(successful_eps)
+            git_commit_push(results)
 
-    # Summary
+    # ── Summary ───────────────────────────────────────────────────────────
     print("\n── Run summary ──")
-    for ep, hs_url, ss_url in results:
-        hs = "OK" if hs_url else "FAIL"
-        ss = "OK" if ss_url else "FAIL"
-        print(f"  EP {ep:>4}  SS:{ss}  HS:{hs}")
+    for num, is_movie, hs_url, ss_url in results:
+        kind = "Movie" if is_movie else "EP"
+        hs   = "OK" if hs_url else "FAIL"
+        ss   = "OK" if ss_url else "FAIL"
+        print(f"  {kind} {num:>4}  SS:{ss}  HS:{hs}")
 
-    failed = [ep for ep, hs, ss in results if not hs and not ss]
+    failed = [n for n, _m, hs, ss in results if not hs and not ss]
     if failed:
-        print(f"\n  {len(failed)} episode(s) fully failed: {failed}")
+        print(f"\n  {len(failed)} fully failed: {failed}")
         sys.exit(1)
     else:
-        print(f"\n  All {len(results)} episode(s) done.")
+        print(f"\n  All {len(results)} done.")
 
 
 if __name__ == "__main__":
