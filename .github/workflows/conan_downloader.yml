@@ -30,8 +30,12 @@ on:
       # ════════════════════════════════════════════════════════════════════
       episode_override:
         description: |
-          [EPISODES] Force a specific episode number (e.g. 1194).
-          Leave blank to auto-calculate from the base date.
+          [EPISODES] Episode(s) to download. Three formats:
+            Single:    1000          (just episode 1000)
+            Range:     1000-1005     (1000 through 1005 inclusive)
+            Specific:  1000,1005     (1000 and 1005, nothing in between)
+            Mix:       1000,1003-1005,1010
+          Leave blank to auto-calculate this week's episode from the base date.
         required: false
         default: ''
 
