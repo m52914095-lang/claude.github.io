@@ -12,14 +12,26 @@ on:
       # ════════════════════════════════════════════════════════════════════
       # SECTION 1 — MAGNETS
       # Paste one or more magnet links here to skip Nyaa search entirely.
-      # One per line  OR  comma-separated.
-      # The script will auto-detect episode vs movie from each filename.
+      # One per line OR comma-separated.
+      # The script auto-detects episode vs movie from each filename.
       # ════════════════════════════════════════════════════════════════════
       magnet_links:
         description: |
           [MAGNETS] Batch magnet links (one per line or comma-separated).
           Auto-detects Movie vs Episode from each filename.
-          Leave blank to use auto Nyaa search instead.
+          Leave blank to use Nyaa search instead.
+        required: false
+        default: ''
+
+      select_files:
+        description: |
+          [MAGNETS] Pick specific file(s) from the torrent instead of downloading all.
+          Use this when a torrent has 100 files but you only want file 32.
+            Single:   32        (just file 32)
+            Range:    32-35     (files 32 through 35)
+            Specific: 32,40     (files 32 and 40 only)
+            Mix:      32,40-42
+          Leave blank to download everything in the torrent.
         required: false
         default: ''
 
@@ -30,19 +42,20 @@ on:
       # ════════════════════════════════════════════════════════════════════
       episode_override:
         description: |
-          [EPISODES] Episode(s) to download. Three formats:
-            Single:    1000          (just episode 1000)
-            Range:     1000-1005     (1000 through 1005 inclusive)
-            Specific:  1000,1005     (1000 and 1005, nothing in between)
-            Mix:       1000,1003-1005,1010
-          Leave blank to auto-calculate this week's episode from the base date.
+          [EPISODES] Episode(s) to download. Formats:
+            Single:   1000            (just episode 1000)
+            Range:    1000-1005       (1000 through 1005 inclusive)
+            Specific: 1000,1005       (1000 and 1005, nothing in between)
+            Mix:      1000,1003-1005,1010
+          Leave blank to auto-calculate this week's episode.
         required: false
         default: ''
 
       nyaa_uploader_url:
         description: |
           [EPISODES] Custom Nyaa.si uploader profile URL.
-          Default: SubsPlease.  e.g. https://nyaa.si/user/Erai-raws
+          Default: tries SubsPlease then Erai-raws automatically.
+          e.g. https://nyaa.si/user/Erai-raws
         required: false
         default: ''
 
@@ -55,47 +68,42 @@ on:
 
       ep_hs_title:
         description: |
-          [EPISODES] Hard-sub DoodStream title template.
-          Use {ep} as the episode number placeholder.
+          [EPISODES] Hard-sub title on DoodStream. Use {ep} as placeholder.
         required: false
         default: 'Detective Conan - {ep} HS'
 
       ep_ss_title:
         description: |
-          [EPISODES] Soft-sub DoodStream title template.
-          Use {ep} as the episode number placeholder.
+          [EPISODES] Soft-sub title on StreamP2P. Use {ep} as placeholder.
         required: false
         default: 'Detective Conan - {ep} SS'
 
       # ════════════════════════════════════════════════════════════════════
       # SECTION 3 — MOVIES
-      # Set movie_mode=1 when downloading movies via magnet_links
-      # so the script forces movie routing even if "Movie" isn't in the filename.
-      # Normally leave this blank — the script auto-detects from the filename.
+      # Auto-detection reads "Movie"/"OVA"/"Film" from the filename.
+      # Only set movie_mode=1 if the filename has none of those keywords.
       # ════════════════════════════════════════════════════════════════════
       movie_mode:
         description: |
           [MOVIES] Force all files to be treated as movies.
-          Set to 1 only if the filename doesn't contain "Movie"/"OVA"/"Film".
+          Set to 1 only if filename lacks "Movie"/"OVA"/"Film".
           Leave blank for auto-detection (recommended).
         required: false
         default: '0'
 
       movie_hs_title:
         description: |
-          [MOVIES] Hard-sub DoodStream title template.
-          Use {num} as the movie number placeholder.
+          [MOVIES] Hard-sub title on DoodStream. Use {num} as placeholder.
         required: false
         default: 'Detective Conan Movie - {num} HS'
 
       movie_ss_title:
         description: |
-          [MOVIES] Soft-sub DoodStream title template.
-          Use {num} as the movie number placeholder.
+          [MOVIES] Soft-sub title on StreamP2P. Use {num} as placeholder.
         required: false
         default: 'Detective Conan Movie - {num} SS'
 
-# ── Base config (edit here to update the episode counter baseline) ────────────
+# ── Base config ───────────────────────────────────────────────────────────────
 env:
   BASE_EPISODE: '1193'
   BASE_DATE: '2026-03-14'
@@ -113,42 +121,68 @@ jobs:
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # ── 2. System deps ─────────────────────────────────────────────────
+      # ── 2. Free up disk space (~30 GB recovered) ───────────────────────
+      # The runner starts with ~50 GB eaten by tools you don't need.
+      # Removing them gives ~50+ GB free instead of the default ~22 GB.
+      - name: Free up disk space
+        run: |
+          echo "Disk before cleanup:"
+          df -h /
+          sudo rm -rf /usr/share/dotnet
+          sudo rm -rf /usr/local/lib/android
+          sudo rm -rf /opt/ghc
+          sudo rm -rf /usr/local/.ghcup
+          sudo rm -rf /opt/hostedtoolcache
+          sudo rm -rf /usr/share/swift
+          sudo rm -rf /usr/local/share/boost
+          sudo rm -rf /usr/lib/jvm
+          sudo rm -rf /usr/share/az_3*
+          sudo rm -rf /usr/local/graalvm
+          echo "Disk after cleanup:"
+          df -h /
+
+      # ── 3. System deps ─────────────────────────────────────────────────
       - name: Install system dependencies (aria2, ffmpeg)
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y aria2 ffmpeg
 
-      # ── 3. Python ──────────────────────────────────────────────────────
+      # ── 4. Python ──────────────────────────────────────────────────────
       - name: Set up Python 3.12
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
       - name: Install Python dependencies
-        run: pip install requests beautifulsoup4
+        run: pip install requests beautifulsoup4 tuspy
 
-      # ── 4. Run ────────────────────────────────────────────────────────
+      # ── 5. Run ────────────────────────────────────────────────────────
       - name: Run Conan automation
         run: python conan_automation_github.py
         env:
-          # DoodStream credentials (set these in repo Settings → Secrets)
+          # ── DoodStream (Hard Subs) ─────────────────────────────────────
+          # Set these in repo Settings → Secrets → Actions
           DOODSTREAM_API_KEY:   ${{ secrets.DOODSTREAM_API_KEY }}
           HARD_SUB_FOLDER_ID:   ${{ secrets.HARD_SUB_FOLDER_ID }}
-          SOFT_SUB_FOLDER_ID:   ${{ secrets.SOFT_SUB_FOLDER_ID }}
+
+          # ── StreamP2P (Soft Subs) ──────────────────────────────────────
+          # Set this in repo Settings → Secrets → Actions
+          STREAMP2P_API_KEY:    ${{ secrets.STREAMP2P_API_KEY }}
+
           HTML_FILE:            index.html
 
-          # MAGNETS
+          # ── MAGNETS ────────────────────────────────────────────────────
           MAGNET_LINKS:         ${{ github.event.inputs.magnet_links        || '' }}
+          SELECT_FILES:         ${{ github.event.inputs.select_files         || '' }}
 
-          # EPISODES
+          # ── EPISODES ───────────────────────────────────────────────────
           EPISODE_OVERRIDE:     ${{ github.event.inputs.episode_override    || '' }}
           NYAA_UPLOADER_URL:    ${{ github.event.inputs.nyaa_uploader_url   || '' }}
           CUSTOM_SEARCH:        ${{ github.event.inputs.custom_search_query || '' }}
           HS_TITLE_TPL:         ${{ github.event.inputs.ep_hs_title         || 'Detective Conan - {ep} HS' }}
           SS_TITLE_TPL:         ${{ github.event.inputs.ep_ss_title         || 'Detective Conan - {ep} SS' }}
 
-          # MOVIES
+          # ── MOVIES ─────────────────────────────────────────────────────
           MOVIE_MODE:           ${{ github.event.inputs.movie_mode          || '0' }}
           MOVIE_HS_TITLE_TPL:   ${{ github.event.inputs.movie_hs_title      || 'Detective Conan Movie - {num} HS' }}
           MOVIE_SS_TITLE_TPL:   ${{ github.event.inputs.movie_ss_title      || 'Detective Conan Movie - {num} SS' }}
