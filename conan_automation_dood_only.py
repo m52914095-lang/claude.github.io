@@ -51,6 +51,7 @@ CUSTOM_SEARCH       = os.environ.get("CUSTOM_SEARCH",       "").strip()
 NYAA_UPLOADER_URL   = os.environ.get("NYAA_UPLOADER_URL",   "").strip()
 MOVIE_MODE          = os.environ.get("MOVIE_MODE", "0").strip() == "1"
 SELECT_FILES        = os.environ.get("SELECT_FILES", "").strip()
+SUBTITLE_MAGNET     = os.environ.get("SUBTITLE_MAGNET", "").strip()
 
 HS_TITLE_TPL        = os.environ.get("HS_TITLE_TPL",       "Detective Conan - {ep} HS")
 SS_TITLE_TPL        = os.environ.get("SS_TITLE_TPL",       "Detective Conan - {ep} SS")
@@ -410,6 +411,58 @@ def upload_to_doodstream(file_path: str, title: str, folder_id: str = "") -> str
     print(f"  [DoodStream] All {UPLOAD_RETRIES} attempts failed for '{title}'",
           file=sys.stderr)
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUBTITLE DOWNLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def download_subtitle_magnet(magnet: str) -> list:
+    """
+    Download a subtitle-only magnet with aria2c.
+    Only keeps subtitle file types — ignores any video files.
+    Returns list of subtitle file paths found after download.
+    """
+    sub_exts = (".srt", ".ass", ".ssa", ".sub", ".vtt")
+    before   = set(f for f in glob.glob("**/*", recursive=True)
+                   if os.path.splitext(f)[1].lower() in sub_exts)
+
+    print(f"  [Subtitle Magnet] Downloading: {magnet[:100]}...")
+
+    cmd = [
+        "aria2c",
+        "--seed-time=0",
+        "--bt-enable-lpd=true",
+        "--enable-dht=true",
+        "--enable-dht6=true",
+        "--enable-peer-exchange=true",
+        "--max-connection-per-server=8",
+        "--split=8",
+        "--file-allocation=none",
+        "--bt-stop-timeout=300",
+        "--summary-interval=30",
+        "--console-log-level=notice",
+        magnet,
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        print("  [Subtitle Magnet] Timeout — checking for completed files",
+              file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"  [Subtitle Magnet] aria2c exit {e.returncode} — checking files",
+              file=sys.stderr)
+
+    after = set(f for f in glob.glob("**/*", recursive=True)
+                if os.path.splitext(f)[1].lower() in sub_exts)
+    new_subs = sorted(after - before)
+
+    # Filter out stubs (< 100 bytes = empty/placeholder files)
+    valid = [f for f in new_subs if os.path.getsize(f) > 100]
+    print(f"  [Subtitle Magnet] Found {len(valid)} subtitle file(s):")
+    for s in valid:
+        print(f"    {s}")
+    return valid
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -660,6 +713,7 @@ CUSTOM_SEARCH       = os.environ.get("CUSTOM_SEARCH",       "").strip()
 NYAA_UPLOADER_URL   = os.environ.get("NYAA_UPLOADER_URL",   "").strip()
 MOVIE_MODE          = os.environ.get("MOVIE_MODE", "0").strip() == "1"
 SELECT_FILES        = os.environ.get("SELECT_FILES", "").strip()
+SUBTITLE_MAGNET     = os.environ.get("SUBTITLE_MAGNET", "").strip()
 
 HS_TITLE_TPL        = os.environ.get("HS_TITLE_TPL",       "Detective Conan - {ep} HS")
 SS_TITLE_TPL        = os.environ.get("SS_TITLE_TPL",       "Detective Conan - {ep} SS")
@@ -1019,6 +1073,58 @@ def upload_to_doodstream(file_path: str, title: str, folder_id: str = "") -> str
     print(f"  [DoodStream] All {UPLOAD_RETRIES} attempts failed for '{title}'",
           file=sys.stderr)
     return None
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SUBTITLE DOWNLOAD
+# ══════════════════════════════════════════════════════════════════════════════
+
+def download_subtitle_magnet(magnet: str) -> list:
+    """
+    Download a subtitle-only magnet with aria2c.
+    Only keeps subtitle file types — ignores any video files.
+    Returns list of subtitle file paths found after download.
+    """
+    sub_exts = (".srt", ".ass", ".ssa", ".sub", ".vtt")
+    before   = set(f for f in glob.glob("**/*", recursive=True)
+                   if os.path.splitext(f)[1].lower() in sub_exts)
+
+    print(f"  [Subtitle Magnet] Downloading: {magnet[:100]}...")
+
+    cmd = [
+        "aria2c",
+        "--seed-time=0",
+        "--bt-enable-lpd=true",
+        "--enable-dht=true",
+        "--enable-dht6=true",
+        "--enable-peer-exchange=true",
+        "--max-connection-per-server=8",
+        "--split=8",
+        "--file-allocation=none",
+        "--bt-stop-timeout=300",
+        "--summary-interval=30",
+        "--console-log-level=notice",
+        magnet,
+    ]
+    try:
+        subprocess.run(cmd, check=True, timeout=3600)
+    except subprocess.TimeoutExpired:
+        print("  [Subtitle Magnet] Timeout — checking for completed files",
+              file=sys.stderr)
+    except subprocess.CalledProcessError as e:
+        print(f"  [Subtitle Magnet] aria2c exit {e.returncode} — checking files",
+              file=sys.stderr)
+
+    after = set(f for f in glob.glob("**/*", recursive=True)
+                if os.path.splitext(f)[1].lower() in sub_exts)
+    new_subs = sorted(after - before)
+
+    # Filter out stubs (< 100 bytes = empty/placeholder files)
+    valid = [f for f in new_subs if os.path.getsize(f) > 100]
+    print(f"  [Subtitle Magnet] Found {len(valid)} subtitle file(s):")
+    for s in valid:
+        print(f"    {s}")
+    return valid
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -1379,6 +1485,17 @@ def main() -> None:
     global SUB_MAP
     all_mkv  = []
     all_subs = []   # external subtitle files collected across all downloads
+
+    # ── Step 0: download subtitle magnet first (if provided) ──────────────
+    if SUBTITLE_MAGNET:
+        print(f"\n── Downloading subtitle magnet ──")
+        subtitle_files = download_subtitle_magnet(SUBTITLE_MAGNET)
+        all_subs.extend(subtitle_files)
+        if subtitle_files:
+            print(f"  Subtitle magnet done — {len(subtitle_files)} file(s) ready")
+        else:
+            print("  WARNING: subtitle magnet produced no subtitle files",
+                  file=sys.stderr)
 
     # ── Source: batch magnet links ─────────────────────────────────────────
     if MAGNET_LINKS:
