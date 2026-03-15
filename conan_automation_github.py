@@ -109,12 +109,65 @@ def parse_file_info(filename: str) -> tuple:
     return None, False
 
 
-def get_expected_episode() -> int:
-    if EPISODE_OVERRIDE and EPISODE_OVERRIDE.isdigit():
-        return int(EPISODE_OVERRIDE)
+def get_auto_episode() -> int:
+    """Return the single auto-calculated episode based on BASE_DATE."""
     base_dt = datetime.strptime(BASE_DATE, "%Y-%m-%d")
     weeks   = max(0, (datetime.now() - base_dt).days // 7)
     return BASE_EPISODE + weeks
+
+
+def parse_episode_override(raw: str) -> list:
+    """
+    Parse EPISODE_OVERRIDE into a list of episode numbers.
+
+    Formats supported:
+      "1000"        -> [1000]               single episode
+      "1000-1005"   -> [1000,1001,...,1005]  inclusive range
+      "1000,1005"   -> [1000, 1005]          specific list (no in-between)
+      ""            -> [auto-calculated]     blank = this week's episode
+
+    You can also mix comma entries with ranges:
+      "1000,1003-1005,1010"  -> [1000, 1003, 1004, 1005, 1010]
+    """
+    raw = raw.strip()
+    if not raw:
+        return [get_auto_episode()]
+
+    episodes = []
+    # Split on commas first, then handle each part
+    for part in raw.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            # Range like "1000-1005"
+            halves = part.split("-", 1)
+            try:
+                start = int(halves[0].strip())
+                end   = int(halves[1].strip())
+                if start > end:
+                    start, end = end, start   # tolerate reversed input
+                episodes.extend(range(start, end + 1))
+            except ValueError:
+                print(f"  WARNING: could not parse range '{part}' — skipping", file=sys.stderr)
+        else:
+            try:
+                episodes.append(int(part))
+            except ValueError:
+                print(f"  WARNING: could not parse episode '{part}' — skipping", file=sys.stderr)
+
+    if not episodes:
+        print("  WARNING: episode override produced no valid numbers — using auto", file=sys.stderr)
+        return [get_auto_episode()]
+
+    # Deduplicate while preserving order
+    seen = set()
+    unique = []
+    for ep in episodes:
+        if ep not in seen:
+            seen.add(ep)
+            unique.append(ep)
+    return unique
 
 
 # ── Nyaa search ───────────────────────────────────────────────────────────────
@@ -369,7 +422,7 @@ def process_file(mkv_file: str):
     num, is_movie = parse_file_info(mkv_file)
 
     if num is None:
-        num      = get_expected_episode()
+        num      = get_auto_episode()
         is_movie = MOVIE_MODE
         print(f"  Could not parse from filename — using calculated: EP {num}")
     else:
@@ -496,17 +549,31 @@ def main() -> None:
             else:
                 all_mkv.extend(new_files)
     else:
-        episode = get_expected_episode()
-        print(f"Auto mode — episode {episode} | Movie mode: {MOVIE_MODE}")
-        magnet  = search_nyaa(episode)
-        if not magnet:
-            print(f"Episode {episode} not on Nyaa yet.")
+        episodes = parse_episode_override(EPISODE_OVERRIDE)
+        if len(episodes) == 1 and not EPISODE_OVERRIDE.strip():
+            print(f"Auto mode — episode {episodes[0]} (calculated) | Movie mode: {MOVIE_MODE}")
+        else:
+            print(f"Episode mode — {len(episodes)} episode(s): {episodes} | Movie mode: {MOVIE_MODE}")
+
+        not_found = []
+        for ep in episodes:
+            print(f"\n  Searching for episode {ep}...")
+            magnet = search_nyaa(ep)
+            if not magnet:
+                print(f"  Episode {ep} not found on Nyaa — skipping", file=sys.stderr)
+                not_found.append(ep)
+                continue
+            new_files = download_magnet(magnet)
+            if not new_files:
+                print(f"  No .mkv files downloaded for episode {ep}", file=sys.stderr)
+            else:
+                all_mkv.extend(new_files)
+
+        if not_found:
+            print(f"\n  Episodes not found on Nyaa: {not_found}", file=sys.stderr)
+        if not all_mkv:
+            print("No files downloaded at all.", file=sys.stderr)
             sys.exit(0)
-        new_files = download_magnet(magnet)
-        if not new_files:
-            print("No .mkv files after download", file=sys.stderr)
-            sys.exit(1)
-        all_mkv.extend(new_files)
 
     if not all_mkv:
         print("Nothing to process.")
