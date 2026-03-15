@@ -27,6 +27,14 @@ on:
         required: false
         default: ''
 
+      subtitle_magnet:
+        description: |
+          [MAGNETS] Separate magnet containing ONLY subtitle files.
+          Downloaded first, matched by episode number, used for hardsubbing.
+          Leave blank if your video torrent has embedded subtitles.
+        required: false
+        default: ''
+
       # ════════════════════════════════════════════════════════════════════
       # SECTION 2 — EPISODES
       # ════════════════════════════════════════════════════════════════════
@@ -140,6 +148,7 @@ jobs:
           # MAGNETS
           MAGNET_LINKS:         ${{ github.event.inputs.magnet_links        || '' }}
           SELECT_FILES:         ${{ github.event.inputs.select_files         || '' }}
+          SUBTITLE_MAGNET:      ${{ github.event.inputs.subtitle_magnet       || '' }}
 
           # EPISODES
           EPISODE_OVERRIDE:     ${{ github.event.inputs.episode_override    || '' }}
