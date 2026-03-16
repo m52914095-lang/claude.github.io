@@ -61,8 +61,8 @@ MOVIE_HS_TITLE_TPL  = os.environ.get("MOVIE_HS_TITLE_TPL", "Detective Conan Movi
 MOVIE_SS_TITLE_TPL  = os.environ.get("MOVIE_SS_TITLE_TPL", "Detective Conan Movie - {num} SS")
 
 # Optional folder IDs - leave blank to upload to DoodStream root
-HARD_SUB_FOLDER_ID  = os.environ.get("HARD_SUB_FOLDER_ID", "").strip()
-SOFT_SUB_FOLDER_ID  = os.environ.get("SOFT_SUB_FOLDER_ID", "").strip()
+HARD_SUB_FOLDER_ID  = os.environ.get("HARD_SUB_FOLDER_ID", "thzdkzl93o").strip()
+SOFT_SUB_FOLDER_ID  = os.environ.get("SOFT_SUB_FOLDER_ID", "5g3dhh9hmi").strip()
 
 HTML_FILE           = os.environ.get("HTML_FILE", "index.html")
 
