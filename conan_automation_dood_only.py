@@ -746,7 +746,7 @@ def process_file(mkv_file):
                       else HS_TITLE_TPL.format(ep=num))
             hs_url = upload_to_doodstream(
                 hs_file, t,
-                folder_id=Hard Sub,
+                folder_id=thzdkzl93o,
                 folder_label="Hard Sub",
             )
         else:
